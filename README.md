@@ -6,6 +6,9 @@
 > **Compatibility:** Built and tested against **game version 4.64**. It may not
 > work on other versions (the engine hooks are found by signature scanning, but
 > are not guaranteed to match a different build).
+>
+> **Multiplayer:** Not tested in multiplayer. It may not work, and may require
+> all players to run the same version of the mod (or none at all).
 
 An in-place `d3d9.dll` proxy that fixes the HUD at ultrawide (21:9) resolutions
 (2560×1080, 3440×1440, 5120×1440, …) for **The Guild II Renaissance**
