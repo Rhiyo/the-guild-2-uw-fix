@@ -1,0 +1,51 @@
+name: Release
+
+# Manual trigger only. Pick the branch via GitHub's "Use workflow from" dropdown
+# and enter a version; the workflow builds d3d9.dll and publishes a release with
+# d3d9.dll + uw_fix.ini attached.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version / tag (e.g. v1.0.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install MinGW (32-bit)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-i686
+
+      - name: Build d3d9.dll
+        run: make
+
+      - name: Stage release artifacts
+        run: |
+          mkdir -p release
+          cp build/d3d9.dll release/d3d9.dll
+          cp dist/uw_fix.ini release/uw_fix.ini
+          ls -l release
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.version }}
+          name: ${{ inputs.version }}
+          body: |
+            Ultrawide HUD fix for The Guild II Renaissance.
+
+            Install: copy `d3d9.dll` and `uw_fix.ini` next to `GuildII.exe`.
+            Built from `${{ github.ref_name }}` @ ${{ github.sha }}.
+          files: |
+            release/d3d9.dll
+            release/uw_fix.ini
