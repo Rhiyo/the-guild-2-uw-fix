@@ -27,7 +27,7 @@ jobs:
           sudo apt-get install -y gcc-mingw-w64-i686
 
       - name: Build d3d9.dll
-        run: make
+        run: make UWFIX_VERSION="${{ inputs.version }}"
 
       - name: Stage release artifacts
         run: |
@@ -45,6 +45,10 @@ jobs:
             Ultrawide HUD fix for The Guild II Renaissance.
 
             Install: copy `d3d9.dll` and `uw_fix.ini` next to `GuildII.exe`.
+
+            **Built and tested against game version 4.64** — it may not work on
+            other versions.
+
             Built from `${{ github.ref_name }}` @ ${{ github.sha }}.
           files: |
             release/d3d9.dll

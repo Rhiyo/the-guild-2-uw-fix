@@ -6,6 +6,13 @@ CFLAGS  = -O2 -Wall -m32
 SRC     = src/uwfix.c src/d3d9_proxy.c
 OUT     = build/d3d9.dll
 
+# Optional: stamp the in-DLL version string (CI passes the release tag).
+# Local builds without it report DLL_VERSION="dev".
+UWFIX_VERSION ?=
+ifneq ($(UWFIX_VERSION),)
+CFLAGS += -DDLL_VERSION='"$(UWFIX_VERSION)"'
+endif
+
 .PHONY: all deploy clean
 
 all: $(OUT)

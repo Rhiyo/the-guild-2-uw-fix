@@ -61,7 +61,9 @@
    GuildII.exe constants (addresses assume preferred base 0x00400000;
    we add the runtime relocation delta below).
    ================================================================ */
-#define DLL_VERSION           "1.0.0"
+#ifndef DLL_VERSION                    /* CI stamps this from the release tag */
+#define DLL_VERSION           "dev"
+#endif
 #define PREFERRED_BASE        0x00400000u
 #define CP_VTABLE_VA          0x00A27B4Cu   /* cl_CharactersPanel vtable */
 #define BP_VTABLE_VA          0x00A274C4u   /* cl_ButtonPanel vtable (bottom-right) */
