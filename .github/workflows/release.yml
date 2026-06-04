@@ -1,8 +1,8 @@
 name: Release
 
 # Manual trigger only. Pick the branch via GitHub's "Use workflow from" dropdown
-# and enter a version; the workflow builds d3d9.dll and publishes a release with
-# d3d9.dll + uw_fix.ini attached.
+# and enter a version; the workflow builds the DLL, zips it together with the ini,
+# and creates a release with that single archive attached.
 on:
   workflow_dispatch:
     inputs:
@@ -10,6 +10,20 @@ on:
         description: "Release version / tag (e.g. v1.0.0)"
         required: true
         type: string
+      notes:
+        description: "Release notes (optional; appears above the auto-generated changelog)"
+        required: false
+        type: string
+      draft:
+        description: "Create as a draft (edit/finish notes in the web UI before publishing)"
+        required: false
+        default: true
+        type: boolean
+      prerelease:
+        description: "Mark as a pre-release"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -29,11 +43,12 @@ jobs:
       - name: Build d3d9.dll
         run: make UWFIX_VERSION="${{ inputs.version }}"
 
-      - name: Stage release artifacts
+      - name: Package DLL + ini into one archive
         run: |
           mkdir -p release
-          cp build/d3d9.dll release/d3d9.dll
-          cp dist/uw_fix.ini release/uw_fix.ini
+          cp build/d3d9.dll dist/uw_fix.ini release/
+          (cd release && zip -j "guild2-uw-fix-${{ inputs.version }}.zip" d3d9.dll uw_fix.ini)
+          rm release/d3d9.dll release/uw_fix.ini
           ls -l release
 
       - name: Create GitHub release
@@ -41,15 +56,20 @@ jobs:
         with:
           tag_name: ${{ inputs.version }}
           name: ${{ inputs.version }}
+          draft: ${{ inputs.draft }}
+          prerelease: ${{ inputs.prerelease }}
+          generate_release_notes: true
           body: |
+            ${{ inputs.notes }}
+
+            ---
             Ultrawide HUD fix for The Guild II Renaissance.
 
-            Install: copy `d3d9.dll` and `uw_fix.ini` next to `GuildII.exe`.
+            **Install:** unzip and copy `d3d9.dll` + `uw_fix.ini` next to `GuildII.exe`.
 
             **Built and tested against game version 4.64** — it may not work on
             other versions.
 
-            Built from `${{ github.ref_name }}` @ ${{ github.sha }}.
+            Built from `${{ github.ref_name }}` @ `${{ github.sha }}`.
           files: |
-            release/d3d9.dll
-            release/uw_fix.ini
+            release/guild2-uw-fix-${{ inputs.version }}.zip
