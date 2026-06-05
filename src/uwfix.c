@@ -124,6 +124,9 @@ static int g_verbose = 0;   /* [UltrawideFix] Verbose (heavy dumps) */
 static uint32_t g_canvas_global = 0;     /* &canvas-object-ptr global */
 static uint8_t *g_text_base = NULL;
 static size_t   g_text_size = 0;
+static uintptr_t g_image_base = 0;       /* whole mapped module (for string scans) */
+static uint32_t  g_image_size = 0;
+static uint32_t g_setvalueint = 0;       /* resolved SetValueInt addr (0 = unresolved) */
 
 /* ================================================================
    Logging
@@ -171,6 +174,8 @@ static void find_text_section(uintptr_t base) {
     if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
     IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+    g_image_base = base;                                  /* whole mapped module */
+    g_image_size = nt->OptionalHeader.SizeOfImage;
     IMAGE_SECTION_HEADER *s = IMAGE_FIRST_SECTION(nt);
     for (int i = 0; i < nt->FileHeader.NumberOfSections; i++) {
         if (memcmp(s[i].Name, ".text", 5) == 0) {
@@ -266,9 +271,67 @@ static int32_t canvas_height(void) {
    callee-cleaned (ret 8). We model __thiscall as fastcall with a dummy edx:
    fastcall puts arg0 in ecx (=this), arg1 in edx (ignored by the callee),
    and pushes the rest -- giving exactly ecx=node, [esp]=key, [esp+4]=value. */
-#define SETVALUEINT_VA 0x00794FF0u
+#define SETVALUEINT_VA 0x00794FF0u      /* fallback addr (preferred base) only  */
 typedef int (__attribute__((fastcall)) *SetValIntFn)(uint32_t node, uint32_t edx,
                                                      const char *key, int value);
+
+/* SetValueInt's prologue. NOT unique on its own (the SetValue<T> family shares
+   it), so it's only used to VALIDATE a resolved address before we ever call it
+   -- a wrong/changed build fails the check and we skip safely instead of
+   jumping into arbitrary code. */
+static const uint8_t SVI_PROLOG[10] =
+    { 0x83,0xEC,0x20, 0x8B,0x44,0x24,0x24, 0x56, 0x8B,0xF1 };
+
+static int svi_prologue_ok(uint32_t addr) {
+    return addr && mem_ok((void*)(uintptr_t)addr, sizeof SVI_PROLOG) &&
+           memcmp((void*)(uintptr_t)addr, SVI_PROLOG, sizeof SVI_PROLOG) == 0;
+}
+
+/* Resolve SetValueInt robustly so it tracks across game builds instead of
+   trusting a hardcoded address. Anchor on the "SetValueInt" string -> its Lua
+   registration in .text (`68 <wrapper> 68 <strVA> 56`) -> the wrapper's final
+   `call <real>` right before its `pop edi/ebp/ebx` epilogue (E8 rel32 5F 5D 5B).
+   Validate the prologue; fall back to the hardcoded address (also validated).
+   Returns 0 if nothing validates -> the bottom-right fix then skips safely. */
+static uint32_t find_setvalueint(void) {
+    uint32_t cand = 0;
+    /* 1. locate the "SetValueInt\0" string anywhere in the mapped module. */
+    static const char KEY[] = "SetValueInt";
+    uint32_t strva = 0;
+    if (g_image_base) {
+        for (uint32_t i = 0; i + sizeof KEY <= g_image_size; i++) {
+            if (memcmp((uint8_t*)(g_image_base + i), KEY, sizeof KEY) == 0) {
+                strva = (uint32_t)(g_image_base + i); break;
+            }
+        }
+    }
+    /* 2. find the registration push pair, read the wrapper function ptr. */
+    if (strva && g_text_base) {
+        uintptr_t tlo = (uintptr_t)g_text_base, thi = tlo + g_text_size;
+        for (size_t i = 0; i + 11 <= g_text_size; i++) {
+            uint8_t *p = g_text_base + i;
+            if (p[0] != 0x68 || p[5] != 0x68 || p[10] != 0x56) continue;
+            uint32_t s2; memcpy(&s2, p + 6, 4);
+            if (s2 != strva) continue;
+            uint32_t wrapper; memcpy(&wrapper, p + 1, 4);
+            if (wrapper < tlo || wrapper >= thi) continue;
+            /* 3. scan the wrapper for `E8 rel32 5F 5D 5B` -> the real call. */
+            uint8_t *w = (uint8_t*)(uintptr_t)wrapper;
+            for (size_t j = 0; j < 0x300 && (uintptr_t)(w + j + 9) <= thi; j++) {
+                if (w[j]==0xE8 && w[j+5]==0x5F && w[j+6]==0x5D && w[j+7]==0x5B) {
+                    int32_t rel; memcpy(&rel, w + j + 1, 4);
+                    cand = (uint32_t)(uintptr_t)(w + j + 5) + (uint32_t)rel;
+                    break;
+                }
+            }
+            if (cand) break;
+        }
+    }
+    if (svi_prologue_ok(cand)) return cand;
+    uint32_t fb = (uint32_t)(SETVALUEINT_VA + g_delta);   /* validated fallback */
+    if (svi_prologue_ok(fb)) return fb;
+    return 0;
+}
 
 /* THE fix: replicate the proven Lua. cl_ButtonPanel honors ABS_X via the
    property system, so setting ABS_X = screenW - W (and ABS_Y = screenH - H)
@@ -276,46 +339,38 @@ typedef int (__attribute__((fastcall)) *SetValIntFn)(uint32_t node, uint32_t edx
    goes through the property setter + relayout, not the resolver args or a raw
    rect poke (both of which failed/disappeared).
 
-   Thread model: SetValueInt mutates UI state + can trigger relayout, so it
-   MUST run on the game thread to avoid racing the renderer. The worker thread
-   only computes the target (bp_apply) and arms g_bp_ready; the actual call
-   fires from bp_game_flush(), invoked once per frame by the d3d9 Present hook
-   (between frames, game thread). This is independent of the head/CharacterPanel
-   fix. Only if no Present pump exists (e.g. a non-d3d9 build) does the worker
-   apply it itself, after a short grace period. */
-#define BP_PUMP_GRACE 3                 /* worker polls to wait for the pump   */
-static volatile int g_bp_ready = 0;     /* target computed + node valid        */
-static volatile int g_bp_done  = 0;     /* SetValueInt applied                 */
-static volatile int g_bp_nx = 0, g_bp_ny = 0;
+   Thread model: SetValueInt mutates UI state + can trigger relayout, so it MUST
+   run on the game thread to avoid racing the renderer. It is applied from
+   bp_game_flush(), called once per frame by the d3d9 Present hook (between
+   frames, game thread) -- so it lands the first frame the panel exists, with no
+   poll delay. Independent of the head/CharacterPanel fix. If no Present pump
+   exists (e.g. a non-d3d9 build) the worker applies it after a grace period. */
+static volatile int g_bp_done = 0;      /* SetValueInt applied */
 
 static void bp_set_now(const char *who) {
-    if (!g_bp_ready || g_bp_done || g_bp_node == 0) return;
+    if (g_bp_done || g_bp_node == 0 || g_setvalueint == 0) return;
+    int32_t cw = canvas_width(), ch = canvas_height();
+    if (cw <= 1400 || ch <= 0) return;              /* wait for ultrawide canvas */
     uint8_t *nd = (uint8_t*)(uintptr_t)g_bp_node;
     if (!mem_ok(nd, 0x80)) return;
-    g_bp_done = 1;                       /* set first: avoid a double-fire race */
-    SetValIntFn SetValueInt = (SetValIntFn)(uintptr_t)(SETVALUEINT_VA + g_delta);
-    SetValueInt(g_bp_node, 0, "ABS_X", g_bp_nx);
-    SetValueInt(g_bp_node, 0, "ABS_Y", g_bp_ny);
-    log_fmt("[uw] bp SetValueInt ABS_X=%d ABS_Y=%d on node %08X (%s)\n",
-            g_bp_nx, g_bp_ny, g_bp_node, who);
+    int nx = cw - BP_GATE_W, ny = ch - BP_GATE_H;
+    g_bp_done = 1;                       /* set first: avoid a double-fire race  */
+    SetValIntFn SetValueInt = (SetValIntFn)(uintptr_t)g_setvalueint;
+    SetValueInt(g_bp_node, 0, "ABS_X", nx);
+    SetValueInt(g_bp_node, 0, "ABS_Y", ny);
+    log_fmt("[uw] bp SetValueInt ABS_X=%d ABS_Y=%d on node %08X via %08X (%s)\n",
+            nx, ny, g_bp_node, g_setvalueint, who);
 }
 
-/* Called every frame from the d3d9 Present hook -> game thread, between
-   frames. The race-free path, decoupled from CharacterPanel. */
+/* Called every frame from the d3d9 Present hook -> game thread, between frames.
+   The race-free path, decoupled from CharacterPanel; applies as soon as the
+   node is captured and the canvas is ultrawide. */
 void bp_game_flush(void) { bp_set_now("game-thread"); }
 
+#define BP_PUMP_GRACE 3                  /* worker polls before the fallback fires */
 static void bp_apply(void) {
-    if (g_bp_node == 0 || g_bp_done) return;
-    if (!g_bp_ready) {
-        int32_t cw = canvas_width(), ch = canvas_height();
-        if (cw <= 1400 || ch <= 0) return;         /* wait for ultrawide canvas */
-        g_bp_nx = cw - BP_GATE_W;
-        g_bp_ny = ch - BP_GATE_H;
-        g_bp_ready = 1;                             /* arm the game-thread pump  */
-        return;
-    }
-    /* armed but the pump hasn't applied it yet -> fall back after a grace gap */
-    static int grace = 0;
+    if (g_bp_done || g_bp_node == 0) return;
+    static int grace = 0;                /* give the Present pump time to land */
     if (++grace >= BP_PUMP_GRACE) bp_set_now("worker-fallback");
 }
 
@@ -639,6 +694,12 @@ static DWORD WINAPI fix_thread(LPVOID unused) {
             install_bp_patch(sites[k] + 8, g_canvas_global);  /* +8 -> call [eax+0xe0] */
         }
         if (!nb) log_line("[uw] bp: signature not found\n");
+        /* Resolve the engine setter (string-anchored, prologue-validated). If it
+           can't be validated on this build, the fix is skipped rather than
+           risking a call into the wrong code. */
+        g_setvalueint = find_setvalueint();
+        log_fmt("[uw] SetValueInt resolved @%08X%s\n", g_setvalueint,
+                g_setvalueint ? "" : " (FAILED -> bottom-right fix skipped)");
     } else log_line("[uw] ButtonPanelRight fix disabled by config\n");
 
     /* The bottom-right fix needs a steady poll to re-assert its rect across
